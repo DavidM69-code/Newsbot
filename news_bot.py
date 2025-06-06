@@ -1,98 +1,156 @@
 import os
 import logging
-import threading
-import socket
-from contextlib import closing
-from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import threading
 
-# --- Configuration --- #
+# Load environment variables
 load_dotenv()
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
-NEWS_API_URL = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
-PORT = 10000  # Must match Render port setting
 
-# --- Setup --- #
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Dummy HTTP server for Render
-app = Flask(__name__)
+# Get configuration from environment
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+NEWSAPI_KEY = os.getenv('NEWSAPI_KEY')
+PING_CHAT_ID = os.getenv('PING_CHAT_ID')  # Your private chat ID (get from @userinfobot)
 
-@app.route('/')
-def health_check():
-    return "🤖 NewsBot is running", 200
+# News categories
+CATEGORIES = {
+    'general': 'General',
+    'business': 'Business',
+    'entertainment': 'Entertainment',
+    'health': 'Health',
+    'science': 'Science',
+    'sports': 'Sports',
+    'technology': 'Technology'
+}
 
-def run_flask():
-    app.run(host='0.0.0.0', port=PORT)
-
-# --- Bot Functions --- #
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome to NewsBot! Send /news for headlines")
-
-async def get_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== Self-Ping System ================== #
+def self_ping(context: CallbackContext):
+    """Automatically pings to keep the bot online"""
     try:
-        response = requests.get(NEWS_API_URL, timeout=10)
-        response.raise_for_status()
-        
-        articles = response.json().get("articles", [])
-        if not articles:
-            await update.message.reply_text("❌ No news found")
-            return
-
-        for article in articles[:5]:  # Limit to 5 articles
-            title = article.get('title', 'No title')
-            url = article.get('url', '')
-            message = f"📰 {title}" + (f"\n🔗 {url}" if url else "")
-            await update.message.reply_text(message)
-
+        context.bot.send_message(
+            chat_id=PING_CHAT_ID,
+            text="🤖 Bot heartbeat - Keeping connection alive",
+            disable_notification=True
+        )
+        logger.info("Keep-alive ping sent")
     except Exception as e:
-        logger.error(f"News fetch error: {e}")
-        await update.message.reply_text("⚠️ Error fetching news. Try again later.")
+        logger.error(f"Ping failed: {e}")
 
-# --- Instance Control --- #
-def port_in_use(port):
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-        return sock.connect_ex(('localhost', port)) == 0
-
-# --- Main --- #
-if __name__ == "__main__":
-    # Validate config
-    if not BOT_TOKEN or not NEWS_API_KEY:
-        logger.error("Missing environment variables!")
-        exit(1)
-
-    # Prevent multiple instances
-    if port_in_use(PORT):
-        logger.error(f"Port {PORT} already in use - another instance running?")
-        exit(1)
-
-    # Start health check server
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Configure bot
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("news", get_news))
-
-    # Clean start
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Starting bot...")
+# ================== News Functions ================== #
+def get_news(category=None, query=None):
+    """Fetch news from NewsAPI"""
+    base_url = "https://newsapi.org/v2/"
+    
+    if query:
+        url = f"{base_url}everything?q={query}&sortBy=publishedAt&apiKey={NEWSAPI_KEY}"
+    elif category:
+        url = f"{base_url}top-headlines?category={category}&apiKey={NEWSAPI_KEY}"
+    else:
+        url = f"{base_url}top-headlines?apiKey={NEWSAPI_KEY}"
     
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False
-        )
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        return data['articles'] if data['status'] == 'ok' else None
     except Exception as e:
-        logger.critical(f"Bot crashed: {e}")
-    finally:
-        logger.info("Bot stopped")
+        logger.error(f"Error fetching news: {e}")
+        return None
+
+def format_news(articles, limit=5):
+    """Format news articles for Telegram"""
+    if not articles:
+        return "No news articles found."
+    
+    messages = []
+    for article in articles[:limit]:
+        title = article.get('title', 'No title')
+        source = article.get('source', {}).get('name', 'Unknown source')
+        url = article.get('url', '#')
+        published_at = article.get('publishedAt', '')
+        
+        if published_at:
+            try:
+                pub_date = datetime.strptime(published_at, '%Y-%m-%dT%H:%M:%SZ')
+                published_at = pub_date.strftime('%B %d, %Y %H:%M UTC')
+            except ValueError:
+                pass
+        
+        message = f"<b>{title}</b>\n<i>Source: {source}</i>"
+        if published_at:
+            message += f"\n<i>Published: {published_at}</i>"
+        message += f"\n<a href='{url}'>Read more</a>"
+        messages.append(message)
+    
+    return "\n\n".join(messages)
+
+# ================== Command Handlers ================== #
+def start(update: Update, context: CallbackContext) -> None:
+    """Send welcome message"""
+    user = update.effective_user
+    update.message.reply_text(
+        f"Hi {user.first_name}!\n\n"
+        "I'm your News Bot. Use /news for latest headlines or /help for commands."
+    )
+
+def news(update: Update, context: CallbackContext) -> None:
+    """Send general news"""
+    articles = get_news()
+    message = format_news(articles)
+    update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
+
+def categories(update: Update, context: CallbackContext) -> None:
+    """Show news categories"""
+    keyboard = [
+        [InlineKeyboardButton(name, callback_data=f"category_{cat}")]
+        for cat, name in CATEGORIES.items()
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text('Choose a category:', reply_markup=reply_markup)
+
+def category_handler(update: Update, context: CallbackContext) -> None:
+    """Handle category selection"""
+    query = update.callback_query
+    query.answer()
+    category = query.data.split('_')[1]
+    articles = get_news(category=category)
+    message = f"<b>{CATEGORIES[category]} News</b>\n\n{format_news(articles)}"
+    query.edit_message_text(text=message, parse_mode='HTML', disable_web_page_preview=True)
+
+# ================== Main Bot Setup ================== #
+def main():
+    """Start the bot with keep-alive pings"""
+    updater = Updater(TELEGRAM_TOKEN)
+    dispatcher = updater.dispatcher
+    job_queue = updater.job_queue
+
+    # Add command handlers
+    dispatcher.add_handler(CommandHandler('start', start))
+    dispatcher.add_handler(CommandHandler('news', news))
+    dispatcher.add_handler(CommandHandler('categories', categories))
+    dispatcher.add_handler(CallbackQueryHandler(category_handler, pattern='^category_'))
+
+    # Set up keep-alive pings (every 10 minutes)
+    job_queue.run_repeating(
+        self_ping,
+        interval=600,  # 10 minutes between pings
+        first=10       # Initial delay (seconds)
+    )
+
+    # Start the bot
+    updater.start_polling()
+    logger.info("Bot started with keep-alive system")
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
